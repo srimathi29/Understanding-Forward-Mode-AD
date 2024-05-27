@@ -1,0 +1,164 @@
+import os
+import jax
+import jax.numpy as jnp
+from flax import linen as nn
+from flax.training import train_state
+from flax.traverse_util import flatten_dict, unflatten_dict
+from transformers import BertTokenizer, BertConfig
+from agnews_sequence_classification_dataloader import get_federated_datasets
+
+AVAILABLE_GPUS = torch.cuda.device_count()
+AVAILABLE_CPUS = os.cpu_count()
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+TIME_FORMAT_STR: str = "%b_%d_%H_%M_%S"
+
+# Set up configuration
+agnews_bert_fedfgd_auto_diff_config = {
+    'total_clients': 10,
+    'epochs': 100,
+    'batch_size': 8,
+    'lr': 1e-3,
+    'max_seq_len': 64,
+    'model_name': 'bert-base-uncased',
+    'fixed_seed': False,
+    'client_id': '0',
+    'experiment_name': 'flax-bert',
+    'random_seed': 0,
+    'checkpoint_dir': './results/agnews_bert/flax/',
+}
+
+# Load data
+agnews_train_dataloader_dict, agnews_test_dataloader_dict = get_federated_datasets(
+    dirichlet_parameter=1.0,
+    num_clients=agnews_bert_fedfgd_auto_diff_config['total_clients'],
+    train_client_batch_size=agnews_bert_fedfgd_auto_diff_config['batch_size'],
+    max_seq_len=agnews_bert_fedfgd_auto_diff_config['max_seq_len'],
+)
+client_id = agnews_bert_fedfgd_auto_diff_config['client_id']
+train_data = agnews_train_dataloader_dict[client_id]
+test_data = agnews_test_dataloader_dict[client_id]
+
+# Set up model and tokenizer
+config = BertConfig.from_pretrained(agnews_bert_fedfgd_auto_diff_config['model_name'])
+tokenizer = BertTokenizer.from_pretrained(agnews_bert_fedfgd_auto_diff_config['model_name'])
+
+## FLAX-BERT Model
+class FlaxBertClassifier(nn.Module):
+    config: BertConfig
+    dtype: jnp.dtype = jnp.float32
+
+    def setup(self):
+        self.bert = nn.scan(
+            nn.BertEncoder,
+            variable_axes={'params': 0},
+            split_rngs={'dropout': True},
+            config=self.config,
+            dtype=self.dtype,
+        )
+        self.classifier = nn.Dense(
+            config.num_labels, kernel_init=nn.initializers.normal(self.config.initializer_range)
+        )
+
+    def __call__(self, input_ids, attention_mask, token_type_ids):
+        bert_outputs = self.bert(input_ids, attention_mask, token_type_ids)
+        pooled_output = bert_outputs[:, 0]  # Take [CLS] token
+        logits = self.classifier(pooled_output)
+        return logits
+
+    def init_weights(self, rng):
+        params = self.init(rng, jnp.ones((1, agnews_bert_fedfgd_auto_diff_config['max_seq_len']), dtype=jnp.int32),
+                           jnp.ones((1, agnews_bert_fedfgd_auto_diff_config['max_seq_len']), dtype=jnp.int32),
+                           jnp.ones((1, agnews_bert_fedfgd_auto_diff_config['max_seq_len']), dtype=jnp.int32))
+        return params
+
+# Initialize model and optimizer
+rng = jax.random.PRNGKey(agnews_bert_fedfgd_auto_diff_config['random_seed'])
+model = FlaxBertClassifier(config=config)
+params = model.init_weights(rng)
+tx = optax.adamw(agnews_bert_fedfgd_auto_diff_config['lr'])
+state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
+
+# Training loop
+@jax.jit
+def train_step(state, batch):
+    input_ids, token_type_ids, attention_mask, labels = batch
+
+    def loss_fn(params):
+        logits = state.apply_fn(params, input_ids, attention_mask, token_type_ids)
+        loss = jnp.mean(optax.softmax_cross_entropy(logits, labels))
+        return loss
+
+    grad_fn = jax.value_and_grad(loss_fn)
+    loss, grads = grad_fn(state.params)
+    new_state = state.apply_gradients(grads=grads)
+    return new_state, loss
+
+for epoch in range(agnews_bert_fedfgd_auto_diff_config['epochs']):
+    for batch in train_data:
+        state, loss = train_step(state, batch)
+        print(f'Epoch {epoch}, Loss: {loss}')
+
+# Evaluation
+@jax.jit
+def eval_step(params, batch):
+    input_ids, token_type_ids, attention_mask, labels = batch
+    logits = model.apply(params, input_ids, attention_mask, token_type_ids)
+    loss = jnp.mean(optax.softmax_cross_entropy(logits, labels))
+    predictions = jnp.argmax(logits, axis=-1)
+    accuracy = jnp.mean(predictions == labels)
+    return loss, accuracy
+
+total_loss = 0
+total_accuracy = 0
+count = 0
+for batch in test_data:
+    loss, accuracy = eval_step(state.params, batch)
+    total_loss += loss
+    total_accuracy += accuracy
+    count += 1
+
+print(f'Test Loss: {total_loss / count}, Test Accuracy: {total_accuracy / count}')
+
+def main():
+    # Load data
+    agnews_train_dataloader_dict, agnews_test_dataloader_dict = get_federated_datasets(
+        dirichlet_parameter=1.0,
+        num_clients=agnews_bert_fedfgd_auto_diff_config['total_clients'],
+        train_client_batch_size=agnews_bert_fedfgd_auto_diff_config['batch_size'],
+        max_seq_len=agnews_bert_fedfgd_auto_diff_config['max_seq_len'],
+    )
+    client_id = agnews_bert_fedfgd_auto_diff_config['client_id']
+    train_data = agnews_train_dataloader_dict[client_id]
+    test_data = agnews_test_dataloader_dict[client_id]
+
+    # Set up model and tokenizer
+    config = BertConfig.from_pretrained(agnews_bert_fedfgd_auto_diff_config['model_name'])
+    tokenizer = BertTokenizer.from_pretrained(agnews_bert_fedfgd_auto_diff_config['model_name'])
+
+    # Initialize model and optimizer
+    rng = jax.random.PRNGKey(agnews_bert_fedfgd_auto_diff_config['random_seed'])
+    model = FlaxBertClassifier(config=config)
+    params = model.init_weights(rng)
+    tx = optax.adamw(agnews_bert_fedfgd_auto_diff_config['lr'])
+    state = train_state.TrainState.create(apply_fn=model.apply, params=params, tx=tx)
+
+    # Training loop
+    for epoch in range(agnews_bert_fedfgd_auto_diff_config['epochs']):
+        for batch in train_data:
+            state, loss = train_step(state, batch)
+            print(f'Epoch {epoch}, Loss: {loss}')
+
+    # Evaluation
+    total_loss = 0
+    total_accuracy = 0
+    count = 0
+    for batch in test_data:
+        loss, accuracy = eval_step(state.params, batch)
+        total_loss += loss
+        total_accuracy += accuracy
+        count += 1
+
+    print(f'Test Loss: {total_loss / count}, Test Accuracy: {total_accuracy / count}')
+
+if __name__ == "__main__":
+    main()
